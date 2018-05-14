@@ -22,11 +22,12 @@ type Forwarder struct {
 	client       *net.UDPAddr
 	listenerConn *net.UDPConn
 
-	connections      map[string]connection
-	connectionsMutex *sync.RWMutex
+	connections map[string]connection
+	sync.RWMutex
 
 	connectCallback    func(addr string)
 	disconnectCallback func(addr string)
+	packetCallback     func(data []byte) []byte
 
 	timeout time.Duration
 
@@ -45,7 +46,6 @@ func Forward(src, dst string, timeout time.Duration) (*Forwarder, error) {
 	forwarder := new(Forwarder)
 	forwarder.connectCallback = func(addr string) {}
 	forwarder.disconnectCallback = func(addr string) {}
-	forwarder.connectionsMutex = new(sync.RWMutex)
 	forwarder.connections = make(map[string]connection)
 	forwarder.timeout = timeout
 
@@ -93,20 +93,20 @@ func (f *Forwarder) janitor() {
 		time.Sleep(f.timeout)
 		var keysToDelete []string
 
-		f.connectionsMutex.RLock()
+		f.RLock()
 		for k, conn := range f.connections {
 			if conn.lastActive.Before(time.Now().Add(-f.timeout)) {
 				keysToDelete = append(keysToDelete, k)
 			}
 		}
-		f.connectionsMutex.RUnlock()
+		f.RUnlock()
 
-		f.connectionsMutex.Lock()
+		f.Lock()
 		for _, k := range keysToDelete {
 			f.connections[k].udp.Close()
 			delete(f.connections, k)
 		}
-		f.connectionsMutex.Unlock()
+		f.Unlock()
 
 		for _, k := range keysToDelete {
 			f.disconnectCallback(k)
@@ -115,9 +115,9 @@ func (f *Forwarder) janitor() {
 }
 
 func (f *Forwarder) handle(data []byte, addr *net.UDPAddr) {
-	f.connectionsMutex.RLock()
+	f.RLock()
 	conn, found := f.connections[addr.String()]
-	f.connectionsMutex.RUnlock()
+	f.RUnlock()
 
 	if !found {
 		conn, err := net.ListenUDP("udp", f.client)
@@ -126,67 +126,68 @@ func (f *Forwarder) handle(data []byte, addr *net.UDPAddr) {
 			return
 		}
 
-		f.connectionsMutex.Lock()
+		f.Lock()
 		f.connections[addr.String()] = connection{
 			udp:        conn,
 			lastActive: time.Now(),
 		}
-		f.connectionsMutex.Unlock()
+		f.Unlock()
 
 		f.connectCallback(addr.String())
-
+		data = f.packetCallback(data)
 		conn.WriteTo(data, f.dst)
 
 		for {
 			buf := make([]byte, bufferSize)
 			n, _, err := conn.ReadFromUDP(buf)
 			if err != nil {
-				f.connectionsMutex.Lock()
+				f.Lock()
 				conn.Close()
 				delete(f.connections, addr.String())
-				f.connectionsMutex.Unlock()
+				f.Unlock()
 				return
 			}
 
 			go func(data []byte, conn *net.UDPConn, addr *net.UDPAddr) {
+				data = f.packetCallback(data)
 				f.listenerConn.WriteTo(data, addr)
 			}(buf[:n], conn, addr)
 		}
 	}
-
+	data = f.packetCallback(data)
 	conn.udp.WriteTo(data, f.dst)
 
 	shouldChangeTime := false
-	f.connectionsMutex.RLock()
+	f.RLock()
 	if _, found := f.connections[addr.String()]; found {
 		if f.connections[addr.String()].lastActive.Before(
 			time.Now().Add(f.timeout / 4)) {
 			shouldChangeTime = true
 		}
 	}
-	f.connectionsMutex.RUnlock()
+	f.RUnlock()
 
 	if shouldChangeTime {
-		f.connectionsMutex.Lock()
+		f.Lock()
 		// Make sure it still exists
 		if _, found := f.connections[addr.String()]; found {
 			connWrapper := f.connections[addr.String()]
 			connWrapper.lastActive = time.Now()
 			f.connections[addr.String()] = connWrapper
 		}
-		f.connectionsMutex.Unlock()
+		f.Unlock()
 	}
 }
 
 // Close stops the forwarder.
 func (f *Forwarder) Close() {
-	f.connectionsMutex.Lock()
+	f.Lock()
+	defer f.Unlock()
 	f.closed = true
 	for _, conn := range f.connections {
 		conn.udp.Close()
 	}
 	f.listenerConn.Close()
-	f.connectionsMutex.Unlock()
 }
 
 // OnConnect can be called with a callback function to be called whenever a
@@ -201,10 +202,16 @@ func (f *Forwarder) OnDisconnect(callback func(addr string)) {
 	f.disconnectCallback = callback
 }
 
+// OnPacket can be called with a callback function to be called whenever a
+// new package is forwarded
+func (f *Forwarder) OnPacket(callback func(data []byte) []byte) {
+	f.packetCallback = callback
+}
+
 // Connected returns the list of connected clients in IP:port form.
 func (f *Forwarder) Connected() []string {
-	f.connectionsMutex.Lock()
-	defer f.connectionsMutex.Unlock()
+	f.RLock()
+	defer f.RUnlock()
 	results := make([]string, 0, len(f.connections))
 	for key := range f.connections {
 		results = append(results, key)
