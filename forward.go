@@ -22,7 +22,7 @@ type Forwarder struct {
 	client       *net.UDPAddr
 	listenerConn *net.UDPConn
 
-	connections map[string]connection
+	connections map[string]*connection
 	sync.RWMutex
 
 	connectCallback    func(addr string)
@@ -46,7 +46,7 @@ func Forward(src, dst string, timeout time.Duration) (*Forwarder, error) {
 	forwarder := new(Forwarder)
 	forwarder.connectCallback = func(addr string) {}
 	forwarder.disconnectCallback = func(addr string) {}
-	forwarder.connections = make(map[string]connection)
+	forwarder.connections = make(map[string]*connection)
 	forwarder.timeout = timeout
 
 	var err error
@@ -95,7 +95,7 @@ func (f *Forwarder) janitor() {
 
 		f.RLock()
 		for k, conn := range f.connections {
-			if conn.lastActive.Before(time.Now().Add(-f.timeout)) {
+			if time.Since(conn.lastActive) > f.timeout {
 				keysToDelete = append(keysToDelete, k)
 			}
 		}
@@ -127,7 +127,7 @@ func (f *Forwarder) handle(data []byte, addr *net.UDPAddr) {
 		}
 
 		f.Lock()
-		f.connections[addr.String()] = connection{
+		f.connections[addr.String()] = &connection{
 			udp:        conn,
 			lastActive: time.Now(),
 		}
@@ -156,27 +156,7 @@ func (f *Forwarder) handle(data []byte, addr *net.UDPAddr) {
 	}
 	data = f.packetCallback(data)
 	conn.udp.WriteTo(data, f.dst)
-
-	shouldChangeTime := false
-	f.RLock()
-	if _, found := f.connections[addr.String()]; found {
-		if f.connections[addr.String()].lastActive.Before(
-			time.Now().Add(f.timeout / 4)) {
-			shouldChangeTime = true
-		}
-	}
-	f.RUnlock()
-
-	if shouldChangeTime {
-		f.Lock()
-		// Make sure it still exists
-		if _, found := f.connections[addr.String()]; found {
-			connWrapper := f.connections[addr.String()]
-			connWrapper.lastActive = time.Now()
-			f.connections[addr.String()] = connWrapper
-		}
-		f.Unlock()
-	}
+	conn.lastActive = time.Now()
 }
 
 // Close stops the forwarder.
